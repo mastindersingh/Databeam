@@ -1,0 +1,84 @@
+import argparse
+import time
+import logging
+import json
+
+import apache_beam as beam
+from apache_beam.options.pipeline_options import GoogleCloudOptions
+from apache_beam.options.pipeline_options import PipelineOptions
+from apache_beam.options.pipeline_options import StandardOptions
+
+
+EXPECTED_FIELDS = ["id", "event_type", "user_id", "timestamp", "metadata"]
+
+def parse_json(element):
+    """Parse JSON safely and normalize fields for BigQuery."""
+    row = json.loads(element)
+
+    # Ensure all expected fields exist
+    for field in EXPECTED_FIELDS:
+        if field not in row:
+            row[field] = None
+
+    # Convert metadata to STRING
+    if isinstance(row["metadata"], (dict, list)):
+        row["metadata"] = json.dumps(row["metadata"])
+    elif row["metadata"] is None:
+        row["metadata"] = ""
+
+    # Remove unexpected fields
+    cleaned = {k: row[k] for k in EXPECTED_FIELDS}
+
+    return cleaned
+
+
+def run():
+    parser = argparse.ArgumentParser(description='Convert Json into BigQuery using Schemas')
+    parser.add_argument('--project', required=True)
+    parser.add_argument('--region', required=True)
+    parser.add_argument('--stagingLocation', required=True)
+    parser.add_argument('--tempLocation', required=True)
+    parser.add_argument('--runner', required=True)
+
+    opts = parser.parse_args()
+
+    options = PipelineOptions()
+    options.view_as(GoogleCloudOptions).project = opts.project
+    options.view_as(GoogleCloudOptions).region = opts.region
+    options.view_as(GoogleCloudOptions).staging_location = opts.stagingLocation
+    options.view_as(GoogleCloudOptions).temp_location = opts.tempLocation
+    options.view_as(GoogleCloudOptions).job_name = f'my-pipeline-{time.time_ns()}'
+    options.view_as(StandardOptions).runner = opts.runner
+
+    input_path = f"gs://{opts.project}/events.json"
+    output_table = f"{opts.project}:logs.logs_table"
+
+    table_schema = {
+        "fields": [
+            {"name": "id", "type": "STRING"},
+            {"name": "event_type", "type": "STRING"},
+            {"name": "user_id", "type": "STRING"},
+            {"name": "timestamp", "type": "TIMESTAMP"},
+            {"name": "metadata", "type": "STRING"}
+        ]
+    }
+
+    logging.getLogger().setLevel(logging.INFO)
+    logging.info("Building pipeline ...")
+
+    with beam.Pipeline(options=options) as p:
+        (
+            p
+            | "ReadFromGCS" >> beam.io.ReadFromText(input_path)
+            | "ParseJSON" >> beam.Map(parse_json)
+            | "WriteToBQ" >> beam.io.WriteToBigQuery(
+                output_table,
+                schema=table_schema,
+                write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND,
+                create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
+            )
+        )
+
+
+if __name__ == '__main__':
+    run()
